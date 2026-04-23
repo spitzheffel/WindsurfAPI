@@ -1770,6 +1770,28 @@ window._firebaseOAuth = async function(provider) {
       </div>
     </div>
 
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <div class="section-title">JSON 批量导入</div>
+          <div class="section-desc">Windsurf-Tool 导出的 JSON 格式（含 sessionToken 的 auth1 账号 / api_key / token）</div>
+        </div>
+      </div>
+      <div class="section-body">
+        <div style="display:flex;gap:8px;align-items:flex-start">
+          <textarea id="import-json" class="input" rows="5" style="flex:1;font-family:monospace;font-size:12px;resize:vertical" placeholder='粘贴 JSON，格式如：&#10;{&#10;  "accounts": [&#10;    { "email": "...", "authScheme": "auth1", "sessionToken": "devin-session-token$...", ... }&#10;  ]&#10;}'></textarea>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <button class="btn btn-primary" onclick="App.importJson()">导入</button>
+            <label class="btn btn-outline" style="cursor:pointer;text-align:center">
+              选文件
+              <input type="file" accept=".json" style="display:none" onchange="App.importFile(event)">
+            </label>
+          </div>
+        </div>
+        <div id="import-result" style="margin-top:8px;font-size:12px;display:none"></div>
+      </div>
+    </div>
+
     <div id="ls-pool-card"></div>
 
     <div class="section">
@@ -3513,6 +3535,53 @@ const App = {
       cb.checked = !cb.checked;
       cb.dispatchEvent(new Event('change'));
     });
+  },
+
+  async importFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      document.getElementById('import-json').value = text;
+      this.importJson();
+    } catch (e) {
+      this.toast('读取文件失败: ' + e.message, 'error');
+    }
+    event.target.value = '';
+  },
+
+  async importJson() {
+    const raw = document.getElementById('import-json').value.trim();
+    const resultDiv = document.getElementById('import-result');
+    if (!raw) return this.toast('请粘贴 JSON 或选择文件', 'error');
+    let data;
+    try { data = JSON.parse(raw); } catch { return this.toast('JSON 格式错误', 'error'); }
+    if (!data.accounts || !Array.isArray(data.accounts) || data.accounts.length === 0) {
+      return this.toast('JSON 中未找到 accounts 数组', 'error');
+    }
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = `<span style="color:var(--text-muted)">正在导入 ${data.accounts.length} 个账号...</span>`;
+    const r = await this.api('POST', '/accounts/import', data);
+    if (r.success) {
+      const ok = r.results.filter(x => x.status === 'active').length;
+      const fail = r.results.filter(x => x.status !== 'active').length;
+      let html = `<span style="color:var(--success);font-weight:600">导入完成：${ok} 成功`;
+      if (fail > 0) html += `，<span style="color:var(--error)">${fail} 失败</span>`;
+      html += '</span>';
+      if (fail > 0) {
+        html += '<div style="margin-top:4px;color:var(--text-muted)">';
+        for (const x of r.results.filter(x => x.status !== 'active')) {
+          html += `<div>${this.esc(x.email)}: ${this.esc(x.error || x.status)}</div>`;
+        }
+        html += '</div>';
+      }
+      resultDiv.innerHTML = html;
+      document.getElementById('import-json').value = '';
+      this.toast(`成功导入 ${ok} 个账号`, 'success');
+      this.loadAccounts();
+    } else {
+      resultDiv.innerHTML = `<span style="color:var(--error)">${this.esc(r.error || '导入失败')}</span>`;
+    }
   },
 
   async addAccount() {

@@ -82,6 +82,12 @@ function _serializeAccounts() {
     // From GetUserStatus — the authoritative tier/entitlement snapshot.
     userStatus: a.userStatus || null,
     userStatusLastFetched: a.userStatusLastFetched || 0,
+    // auth1 scheme fields (Windsurf-Tool export format)
+    authScheme: a.authScheme || '',
+    auth1Token: a.auth1Token || '',
+    sessionToken: a.sessionToken || '',
+    accountId: a.accountId || '',
+    primaryOrgId: a.primaryOrgId || '',
   }));
 }
 
@@ -196,6 +202,12 @@ function loadAccounts() {
         tierManual: !!a.tierManual,
         userStatus: a.userStatus || null,
         userStatusLastFetched: a.userStatusLastFetched || 0,
+        // auth1 scheme fields (Windsurf-Tool export format)
+        authScheme: a.authScheme || '',
+        auth1Token: a.auth1Token || '',
+        sessionToken: a.sessionToken || '',
+        accountId: a.accountId || '',
+        primaryOrgId: a.primaryOrgId || '',
       });
     }
     if (data.length > 0) log.info(`Loaded ${data.length} account(s) from disk`);
@@ -217,7 +229,7 @@ async function fetchAndMergeModelCatalog() {
     const { getCascadeModelConfigs } = await import('./windsurf-api.js');
     const { mergeCloudModels } = await import('./models.js');
     const proxy = getEffectiveProxy(acct.id) || null;
-    const { configs } = await getCascadeModelConfigs(acct.apiKey, proxy);
+    const { configs } = await getCascadeModelConfigs(getEffectiveApiKey(acct), proxy);
     const added = mergeCloudModels(configs);
     log.info(`Model catalog: ${configs.length} cloud models, ${added} new entries merged`);
   } catch (e) {
@@ -296,6 +308,78 @@ export async function addAccountByToken(token, label = '') {
   accounts.push(account);
   saveAccounts();
   log.info(`Account added: ${account.id} (${account.email}) [token] server=${account.apiServerUrl}`);
+  return account;
+}
+
+/**
+ * Build the LS-compatible apiKey for an auth1 account.
+ * Windsurf desktop writes "devin-session-token$<jwt>" as the accessToken
+ * that the LS uses for gRPC authentication.
+ */
+function buildAuth1LsKey(sessionToken) {
+  if (!sessionToken) return '';
+  return sessionToken.startsWith('devin-session-token$')
+    ? sessionToken
+    : `devin-session-token$${sessionToken}`;
+}
+
+/**
+ * Get the effective API key for LS communication.
+ * For auth1 accounts, returns devin-session-token$<sessionToken>.
+ * For legacy accounts, returns the stored apiKey as-is.
+ */
+export function getEffectiveApiKey(account) {
+  if (account.authScheme === 'auth1' && account.sessionToken) {
+    return buildAuth1LsKey(account.sessionToken);
+  }
+  return account.apiKey;
+}
+
+/**
+ * Add account via auth1 scheme (Windsurf new auth system).
+ * Accepts the full account object from Windsurf-Tool export format.
+ * The effective apiKey for LS communication is devin-session-token$<sessionToken>.
+ */
+export function addAccountByAuth1(acctData) {
+  // Deduplicate by sessionToken (primary credential) or email
+  const effectiveKey = buildAuth1LsKey(acctData.sessionToken);
+  const existing = accounts.find(a =>
+    (a.sessionToken && a.sessionToken === acctData.sessionToken) ||
+    (a.apiKey === effectiveKey)
+  );
+  if (existing) return existing;
+
+  const account = {
+    id: randomUUID().slice(0, 8),
+    email: acctData.email || acctData.name || `auth1-${effectiveKey.slice(0, 8)}`,
+    apiKey: acctData.apiKey || effectiveKey,
+    apiServerUrl: acctData.apiServerUrl || 'https://server.self-serve.windsurf.com',
+    method: 'auth1',
+    status: 'active',
+    lastUsed: 0,
+    errorCount: 0,
+    refreshToken: '',
+    expiresAt: 0,
+    refreshTimer: null,
+    addedAt: Date.now(),
+    tier: (acctData.type || 'unknown').toLowerCase(),
+    tierManual: false,
+    capabilities: {},
+    lastProbed: 0,
+    blockedModels: [],
+    credits: null,
+    userStatus: null,
+    userStatusLastFetched: 0,
+    // auth1 scheme fields
+    authScheme: 'auth1',
+    auth1Token: acctData.auth1Token || '',
+    sessionToken: acctData.sessionToken || '',
+    accountId: acctData.accountId || '',
+    primaryOrgId: acctData.primaryOrgId || '',
+  };
+  accounts.push(account);
+  saveAccounts();
+  log.info(`Account added: ${account.id} (${account.email}) [auth1]`);
   return account;
 }
 
@@ -481,6 +565,8 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
     apiServerUrl: account.apiServerUrl || '',
     proxy: getEffectiveProxy(account.id) || null,
     reservationTimestamp,
+    authScheme: account.authScheme || '',
+    sessionToken: account.sessionToken || '',
   };
 }
 
@@ -524,6 +610,8 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
     apiServerUrl: a.apiServerUrl || '',
     proxy: getEffectiveProxy(a.id) || null,
     reservationTimestamp,
+    authScheme: a.authScheme || '',
+    sessionToken: a.sessionToken || '',
   };
 }
 
@@ -592,7 +680,7 @@ export async function ensureLsForAccount(accountId) {
     // requests still await the same Promise if it hasn't finished yet.
     if (ls && account?.apiKey) {
       const { WindsurfClient } = await import('./client.js');
-      const client = new WindsurfClient(account.apiKey, ls.port, ls.csrfToken);
+      const client = new WindsurfClient(getEffectiveApiKey(account), ls.port, ls.csrfToken);
       client.warmupCascade().catch(e => log.warn(`Cascade warmup failed: ${e.message}`));
     }
   } catch (e) {
@@ -817,7 +905,7 @@ export async function refreshCredits(id) {
   try {
     const { getUserStatus } = await import('./windsurf-api.js');
     const proxy = getEffectiveProxy(account.id) || null;
-    const status = await getUserStatus(account.apiKey, proxy);
+    const status = await getUserStatus(getEffectiveApiKey(account), proxy);
     // Drop the huge raw payload before persisting — keep it only in memory for
     // downstream callers (e.g. model catalog cache) to inspect once.
     const { raw, ...persist } = status;
@@ -917,7 +1005,7 @@ export async function fetchUserStatus(id) {
   const ls = getLsFor(proxy);
   if (!ls) { log.warn(`No LS for GetUserStatus on ${account.id}`); return null; }
 
-  const client = new WindsurfClient(account.apiKey, ls.port, ls.csrfToken);
+  const client = new WindsurfClient(getEffectiveApiKey(account), ls.port, ls.csrfToken);
   let status;
   try {
     status = await client.getUserStatus();
@@ -1049,7 +1137,7 @@ export async function probeAccount(id) {
       const info = getModelInfo(modelKey);
       if (!info) continue;
       const useCascade = !!info.modelUid;
-      const client = new WindsurfClient(account.apiKey, port, csrf);
+      const client = new WindsurfClient(getEffectiveApiKey(account), port, csrf);
       try {
         if (useCascade) {
           await client.cascadeChat([{ role: 'user', content: 'hi' }], info.enumValue, info.modelUid);
@@ -1097,7 +1185,7 @@ export async function probeAccount(id) {
         if (rateLimited) break;
         const info = getModelInfo(modelKey);
         if (!info) continue;
-        const client = new WindsurfClient(account.apiKey, port, csrf);
+        const client = new WindsurfClient(getEffectiveApiKey(account), port, csrf);
         try {
           await client.cascadeChat([{ role: 'user', content: 'hi' }], info.enumValue, info.modelUid);
           updateCapability(account.apiKey, modelKey, true, 'cloud_probe');
@@ -1115,6 +1203,15 @@ export async function probeAccount(id) {
     }
   } catch (e) {
     log.warn(`Dynamic cloud probe failed: ${e.message}`);
+  }
+
+  if (ls) {
+    const { getLsEntryByPort } = await import('./langserver.js');
+    const entry = getLsEntryByPort(ls.port);
+    if (entry) {
+      entry.workspaceInit = null;
+      entry.sessionId = null;
+    }
   }
 
   // If GetUserStatus succeeded, its tier decision wins over the inferred one

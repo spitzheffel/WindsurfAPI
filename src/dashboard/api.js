@@ -5,7 +5,7 @@
 
 import { config, log } from '../config.js';
 import {
-  getAccountList, getAccountCount, addAccountByKey, addAccountByToken,
+  getAccountList, getAccountCount, addAccountByKey, addAccountByToken, addAccountByAuth1,
   removeAccount, setAccountStatus, resetAccountErrors, updateAccountLabel,
   isAuthenticated, probeAccount, ensureLsForAccount,
   refreshCredits, refreshAllCredits,
@@ -274,15 +274,49 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     return json(res, 200, { accounts: getAccountList() });
   }
 
+  // POST /accounts/import — batch JSON import (Windsurf-Tool export format)
+  if (subpath === '/accounts/import' && method === 'POST') {
+    try {
+      const accts = Array.isArray(body.accounts) ? body.accounts : [];
+      if (accts.length === 0) return json(res, 400, { error: 'No accounts found in JSON' });
+      const results = [];
+      for (const acct of accts) {
+        try {
+          let result;
+          if (acct.authScheme === 'auth1' || acct.sessionToken || acct.auth1Token) {
+            result = addAccountByAuth1(acct);
+          } else if (acct.api_key || acct.apiKey) {
+            result = addAccountByKey(acct.api_key || acct.apiKey, acct.label || acct.email);
+          } else if (acct.token) {
+            result = await addAccountByToken(acct.token, acct.label || acct.email);
+          } else {
+            results.push({ email: acct.email || '?', status: 'skipped', error: 'No credentials found' });
+            continue;
+          }
+          results.push({ id: result.id, email: result.email, status: 'active' });
+          // Fire-and-forget probe
+          probeAccount(result.id).catch(e => log.warn(`Auto-probe failed: ${e.message}`));
+        } catch (e) {
+          results.push({ email: acct.email || '?', status: 'error', error: e.message });
+        }
+      }
+      return json(res, 200, { success: true, imported: results.filter(r => r.status === 'active').length, total: accts.length, results, ...getAccountCount() });
+    } catch (err) {
+      return json(res, 500, { error: err.message });
+    }
+  }
+
   if (subpath === '/accounts' && method === 'POST') {
     try {
       let account;
-      if (body.api_key) {
+      if (body.authScheme === 'auth1' || body.sessionToken || body.auth1Token) {
+        account = addAccountByAuth1(body);
+      } else if (body.api_key) {
         account = addAccountByKey(body.api_key, body.label);
       } else if (body.token) {
         account = await addAccountByToken(body.token, body.label);
       } else {
-        return json(res, 400, { error: 'Provide api_key or token' });
+        return json(res, 400, { error: 'Provide api_key, token, or auth1 sessionToken' });
       }
       // Fire-and-forget probe so the UI gets tier info shortly after add
       probeAccount(account.id).catch(e => log.warn(`Auto-probe failed: ${e.message}`));

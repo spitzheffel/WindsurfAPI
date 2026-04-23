@@ -30,6 +30,9 @@ const _pool = new Map();
 // would each spawn an LS process, race on the port, and leave an orphan.
 const _pending = new Map();
 let _nextPort = DEFAULT_PORT + 1;
+let _stopping = false;
+let _autoRestartCount = 0;
+const MAX_AUTO_RESTARTS = 5;
 let _binaryPath = DEFAULT_BINARY;
 let _apiServerUrl = DEFAULT_API_URL;
 
@@ -213,12 +216,32 @@ export async function ensureLs(proxy = null) {
       }
       const gone = _pool.get(key);
       _pool.delete(key);
+      _pending.delete(key);
       if (gone?.port) {
         // Drop the pooled HTTP/2 session so the next request to the
         // replacement LS opens a fresh one instead of writing into a
         // dead socket (grpc.js caches one session per port).
         closeSessionForPort(gone.port);
         import('./conversation-pool.js').then(m => m.invalidateFor({ lsPort: gone.port })).catch(() => {});
+      }
+      // Auto-restart after unexpected exit (not a manual stop).
+      // Exponential backoff: 3s, 6s, 9s, ..., 30s max. Capped at MAX_AUTO_RESTARTS
+      // consecutive failures to avoid tight loops when the binary is broken.
+      if (!_stopping && _autoRestartCount < MAX_AUTO_RESTARTS) {
+        _autoRestartCount++;
+        const delay = Math.min(3000 * _autoRestartCount, 30000);
+        log.info(`LS ${key} will auto-restart in ${delay}ms (attempt ${_autoRestartCount}/${MAX_AUTO_RESTARTS})`);
+        setTimeout(() => {
+          if (_pool.has(key)) return; // already restarted by ensureLs
+          log.info(`Auto-restarting LS instance ${key}`);
+          ensureLs(gone?.proxy || null).then(() => {
+            _autoRestartCount = 0; // reset on successful start
+          }).catch(e =>
+            log.error(`LS auto-restart failed: ${e.message}`)
+          );
+        }, delay);
+      } else if (_autoRestartCount >= MAX_AUTO_RESTARTS) {
+        log.error(`LS ${key} exceeded max auto-restarts (${MAX_AUTO_RESTARTS}), giving up. Use dashboard to restart manually.`);
       }
     });
     proc.on('error', (err) => {
@@ -321,6 +344,8 @@ export function getCsrfToken() {
  * Legacy entry point used by index.js — starts the default (no-proxy) LS.
  */
 export async function startLanguageServer(opts = {}) {
+  _stopping = false;
+  _autoRestartCount = 0;
   _binaryPath = opts.binaryPath || process.env.LS_BINARY_PATH || _binaryPath;
   _apiServerUrl = opts.apiServerUrl || process.env.CODEIUM_API_URL || _apiServerUrl;
   const def = await ensureLs(null);
@@ -328,6 +353,7 @@ export async function startLanguageServer(opts = {}) {
 }
 
 export function stopLanguageServer() {
+  _stopping = true;
   for (const [key, entry] of _pool) {
     try { entry.process?.kill('SIGTERM'); } catch {}
     log.info(`LS instance ${key} stopped`);
@@ -355,7 +381,7 @@ export function getLsStatus() {
     pid: def?.process?.pid || null,
     port: def?.port || DEFAULT_PORT,
     startedAt: def?.startedAt || null,
-    restartCount: 0,
+    restartCount: _autoRestartCount,
     instances: Array.from(_pool.entries()).map(([key, e]) => ({
       key, port: e.port,
       pid: e.process?.pid || null,

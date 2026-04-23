@@ -19,7 +19,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import {
   validateApiKey, isAuthenticated, getAccountList, getAccountCount,
-  addAccountByEmail, addAccountByToken, addAccountByKey, removeAccount,
+  addAccountByEmail, addAccountByToken, addAccountByKey, addAccountByAuth1, removeAccount,
 } from './auth.js';
 import { handleChatCompletions } from './handlers/chat.js';
 import { handleMessages } from './handlers/messages.js';
@@ -236,7 +236,9 @@ async function route(req, res) {
         for (const acct of body.accounts) {
           try {
             let result;
-            if (acct.api_key) {
+            if (acct.authScheme === 'auth1' || acct.sessionToken || acct.auth1Token) {
+              result = addAccountByAuth1(acct);
+            } else if (acct.api_key) {
               result = addAccountByKey(acct.api_key, acct.label);
             } else if (acct.token) {
               result = await addAccountByToken(acct.token, acct.label);
@@ -256,14 +258,16 @@ async function route(req, res) {
 
       // Single account
       let account;
-      if (body.api_key) {
+      if (body.authScheme === 'auth1' || body.sessionToken || body.auth1Token) {
+        account = addAccountByAuth1(body);
+      } else if (body.api_key) {
         account = addAccountByKey(body.api_key, body.label);
       } else if (body.token) {
         account = await addAccountByToken(body.token, body.label);
       } else if (body.email && body.password) {
         account = await addAccountByEmail(body.email, body.password);
       } else {
-        return json(res, 400, { error: 'Provide api_key, token, or email+password' });
+        return json(res, 400, { error: 'Provide api_key, token, email+password, or auth1 sessionToken' });
       }
 
       return json(res, 200, {
